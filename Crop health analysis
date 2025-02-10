@@ -1,0 +1,314 @@
+//Define AOI (teafarms)
+Map.centerObject(teaFarms, 15);
+Map.addLayer(teaFarms, {color: "gray"}, "AOI")
+
+// Define the time range for analysis
+var startDate = ee.Date('2020-01-17');
+var endDate = ee.Date('2024-01-15');
+var interval = 5;  // Interval of 5 days
+
+// Generate a list of dates at 5-day intervals
+var dateList = ee.List.sequence(
+  startDate.millis(),  // Start date in milliseconds
+  endDate.millis(),    // End date in milliseconds
+  interval * 24 * 60 * 60 * 1000  // Convert days to milliseconds
+).map(function(millis) {
+  return ee.Date(millis).format('YYYY-MM-dd');
+});
+
+// Load Sentinel-2 Surface Reflectance Collection
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(teaFarms)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(function(image) {
+    var cloudProb = image.select('QA60').lt(10); // Mask clouds
+    var shadowMask = image.select('B8').lt(2000); // Mask shadows (NIR threshold)
+    return image.updateMask(cloudProb).updateMask(shadowMask);
+  });
+
+// Function to get Sentinel-2 imagery for a given date
+var getImageForDate = function(date) {
+  date = ee.Date(date);
+  var image = ee.ImageCollection('COPERNICUS/S2_SR')
+    .filterBounds(teaFarms)
+    .filterDate(date, date.advance(interval, 'day'))
+    .median()
+    .clip(teaFarms)
+    .select(['B4', 'B3', 'B2']) // True color (RGB)
+    .visualize({ min: 0, max: 3000 });
+  return image.set('date', date.format('YYYY-MM-dd'));
+};
+
+// Preload all images in the date range
+var images = dateList.map(getImageForDate);
+
+// Function to calculate NDVI
+var calculateNDVI = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI'); // NIR (B8), Red (B4)
+  return image.addBands(ndvi).clip(teaFarms)
+};
+
+// Function to calculate NDWI
+var calculateNDWI = function(image) {
+  var ndwi = image.normalizedDifference(['B8', 'B11']).rename('NDWI'); // NIR (B8), SWIR (B11)
+  return image.addBands(ndwi).clip(teaFarms)
+};
+
+// Function to calculate NDRE
+var calculateNDRE = function(image) {
+  var ndre = image.normalizedDifference(['B8', 'B5']).rename('NDRE'); // NIR (B8), Red Edge (B5)
+  return image.addBands(ndre).clip(teaFarms)
+};
+
+// Function to calculate Chlorophyll Index (CI)
+var calculateCI = function(image) {
+  var ci = image.expression(
+    '(B5 / B4) - 1', // Chlorophyll Index formula
+    {
+      B5: image.select('B5'), // Red Edge (B5)
+      B4: image.select('B4')  // Red (B4)
+    }
+  ).rename('CI');
+  return image.addBands(ci).clip(teaFarms)};
+
+// Apply NDVI, NDWI, and CI calculations to the image collection
+var processed = s2.map(calculateNDVI).map(calculateNDWI).map(calculateCI).map(calculateNDRE);
+
+// Composite the collection to create a median image
+var composite = processed.reduce(ee.Reducer.median()).clip(teaFarms);
+
+// Function to normalize an index (Min-Max Scaling)
+var normalizeIndex = function(image, index) {
+  var stats = image.select(index).reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: teaFarms,
+    scale: 30,
+    bestEffort: true
+  });
+  var min = ee.Number(stats.get(index + '_min'));
+  var max = ee.Number(stats.get(index + '_max'));
+  return image.expression(
+    '(index - min) / (max - min)', {
+      'index': image.select(index),
+      'min': min,
+      'max': max
+    }).rename(index + '_norm');
+};
+
+// Function to apply weights and compute Weighted Stress
+var computeWeightedStress = function(image) {
+  var ndviNorm = normalizeIndex(image, 'NDVI_median');
+  var ndreNorm = normalizeIndex(image, 'NDRE_median');
+  var ciNorm = normalizeIndex(image, 'CI_median');
+  var ndwiNorm = normalizeIndex(image, 'NDWI_median');
+
+  // Weighted sum formula
+  var weightedStress = ndviNorm.multiply(0.3)
+    .add(ndreNorm.multiply(0.3))
+    .add(ciNorm.multiply(0.1))
+    .add(ndwiNorm.multiply(0.3))
+    .rename('Weighted_Stress');
+
+  return image.addBands(weightedStress);
+};
+
+// Apply the function
+var weightedStressImage = computeWeightedStress(composite);
+
+//// Visualization parameters
+var ndviVisParams = { min: -1, max: 1, palette: ['red', 'yellow', 'green'] };
+var ndwiVisParams = { min: -1, max: 1, palette: ['red', 'yellow', 'green'] };
+var ciVisParams = { min: -1, max: 1, palette: ['red', 'yellow', 'green'] };
+var ndreVisParams = { min: -1, max: 1, palette: ['red', 'yellow', 'green'] };
+var stressVisParams = { min: -1, max: 1, palette: ['red', 'yellow', 'green']}; // Green: Low Stressed, Yellow: Mid-Stressed, Red: Highly Stressed
+
+// Add layers to the map
+// Add Composite Layers to the Map
+Map.addLayer(composite.select('NDVI_median'), ndviVisParams, 'NDVI (Median)');
+Map.addLayer(composite.select('NDWI_median'), ndwiVisParams, 'NDWI (Median)');
+Map.addLayer(composite.select('CI_median'), ciVisParams, 'Chlorophyll Index (Median)');
+Map.addLayer(composite.select('NDRE_median'), ndreVisParams, 'NDRE (Median)');
+Map.addLayer(weightedStressImage.select('Weighted_Stress'), stressVisParams, 'Crop Stress Levels');
+
+
+// Create an interactive dropdown menu for selecting dates
+var dateSelector = ui.Select({
+  items: dateList.getInfo(),
+  placeholder: 'Select a date',
+  onChange: function(selectedDate) {
+    Map.layers().reset(); // Clear previous layers
+    var selectedImage = ee.Image(images.filter(ee.Filter.eq('date', selectedDate)).get(0));
+    //Map.addLayer(selectedImage, {}, 'Image for ' + selectedDate);
+    Map.addLayer(teaFarms, {}, 'Area of Interest');
+    Map.addLayer(composite.select('NDVI_median'), ndviVisParams, 'NDVI');
+    Map.addLayer(composite.select('NDVI_median'), ndwiVisParams, 'NDWI');
+    Map.addLayer(composite.select('NDVI_median'), ciVisParams, 'Chlorophyll Index (CI)');
+    Map.addLayer(composite.select('NDRE_median'), ndreVisParams, 'NDRE (Median)');
+    Map.addLayer(weightedStressImage.select('Weighted_Stress'), stressVisParams, 'Crop Stress Levels');
+
+  }
+});
+
+// Function to create a legend
+var createLegend = function(title, palette, labels, position) {
+  var legend = ui.Panel({
+    style: {
+      position: position,
+      padding: '8px',
+      backgroundColor: 'white'
+    }
+  });
+
+  legend.add(ui.Label({
+    value: title,
+    style: { fontWeight: 'bold',fontSize: '14px', margin: '0 0 4px 0' }
+  }));
+
+  palette.forEach(function(color, index) {
+    var row = ui.Panel({
+      widgets: [
+        ui.Label({
+          style: { backgroundColor: color, padding: '8px', margin: '0', border: '1px solid black' }
+        }),
+        ui.Label({
+          value: labels[index],
+          style: { margin: '4px' }
+        })
+      ],
+      layout: ui.Panel.Layout.Flow('horizontal')
+    });
+    legend.add(row);
+  });
+
+  return legend;
+};
+
+// NDVI Legend (Right)
+var ndviPalette = ['red', 'yellow', 'green'];
+var ndviLabels = ['Low', 'Moderate', 'High'];
+Map.add(createLegend('NDVI', ndviPalette, ndviLabels, 'bottom-right'));
+
+// NDWI Legend (Right)
+var ndwiPalette = ['red', 'yellow', 'green'];
+var ndwiLabels = ['Low', 'Moderate', 'High'];
+Map.add(createLegend('NDWI', ndwiPalette, ndwiLabels, 'bottom-right'));
+
+// NDRE Legend (Right)
+var ndrePalette = ['red', 'yellow', 'green'];
+var ndreLabels = ['Low', 'Moderate', 'High'];
+Map.add(createLegend('NDRE', ndrePalette, ndreLabels, 'bottom-right'));
+
+// CI Legend (Left)
+var ciPalette = ['red', 'yellow', 'green'];
+var ciLabels = ['Low', 'Moderate', 'High'];
+Map.add(createLegend('Chlorophyll Index', ciPalette, ciLabels, 'bottom-left'));
+
+// Legend for Stress Levels
+var stressPalette = ['red', 'yellow', 'green'];
+var stressLabels = ['High Stressed', 'Mid-Stressed', 'Low Stressed'];
+Map.add(createLegend('Crop stress levels', stressPalette, stressLabels, 'bottom-left'));
+
+// Title of the app
+var title = ui.Label('Stress Levels in Croplands', {
+  fontSize: '24px',
+  fontWeight: 'bold',
+  textAlign: 'center',
+  stretch: 'horizontal'
+});
+
+// Create a sub title and description of the map
+var title = ui.Label('Crop Stress and Health Monitoring', {
+  fontSize: '24px',
+  fontWeight: 'bold',
+  textAlign: 'center',
+  stretch: 'horizontal'
+});
+var description = ui.Label('This app visualizes croplands, vegetation indices and stress levels.', {
+  fontSize: '14px',
+  margin: '10px 0'
+});
+var description1 = ui.Label('Select a date to view satellite imagery for a 5-day interval.', {
+  fontSize: '14px',
+  margin: '10px 0'
+});
+
+// Add a DrawingTools widget to the map
+var drawingTools = Map.drawingTools();
+drawingTools.setShown(true);
+drawingTools.setShape('polygon'); // Set the drawing shape to polygon
+
+// Function to calculate the area of a drawn polygon
+function calculateArea() {
+  var layers = drawingTools.layers();
+  if (layers.length() > 0) {
+    var drawnPolygon = layers.get(0).getEeObject(); // Get the first drawn object
+    if (drawnPolygon) {
+      // Calculate the area in square kilometers
+      var area = drawnPolygon.area().divide(1e6);
+      area.evaluate(function(result) {
+        areaLabel.setValue('Area in sqKm: ' + result.toFixed(2));
+      });
+    }
+  } else {
+    areaLabel.setValue('No polygon drawn. Please draw a polygon first.');
+  }
+}
+
+// UI label to display area
+var areaLabel = ui.Label('Area in sqKm: 0');
+
+// Button to trigger area calculation
+var calcButton = ui.Button('Calculate Area', calculateArea);
+
+// Clear button to remove drawn features
+var clearButton = ui.Button('Clear Map', function() {
+  drawingTools.layers().forEach(function(layer) {
+    drawingTools.layers().remove(layer);
+  });
+  areaLabel.setValue('Area in sqKm: 0');
+});
+
+// Create a panel to hold the buttons
+var drawPanel = ui.Panel([ui.Label('Draw a Polygon and Calculate Area'), calcButton, clearButton, areaLabel]);
+
+
+// Add UI components to the app
+var panel = ui.Panel({
+  widgets: [title, description, description1, dateSelector, drawPanel],
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: { width: '300px', padding: '8px' }
+});
+ui.root.insert(0, panel);
+
+// Layer controls
+var layerSelect = ui.Select({
+  items: ['Indices', 'CI', 'NDVI', 'NDWI' , 'NDRE', 'Stress levels'],
+  value: 'Indices',
+  onChange: function(selected) {
+    Map.layers().reset();
+    if (selected === 'Indices' || selected === 'NDVI') {
+      Map.addLayer(composite.select('NDVI_median'), ndviVisParams, 'NDVI');
+    }
+    if (selected === 'Indices' || selected === 'NDWI') {
+      Map.addLayer(composite.select('NDWI_median'), ndwiVisParams, 'NDWI');
+    }
+    if (selected === 'Indices' || selected === 'CI') {
+      Map.addLayer(composite.select('CI_median'), ciVisParams, 'Chlorophyll Index (CI)');
+    }
+    if (selected === 'Indices' || selected === 'NDRE') {
+      Map.addLayer(composite.select('NDRE_median'), ciVisParams, 'NDRE');
+    }
+     if (selected === 'Indices' || selected === 'Stress levels') {
+      Map.addLayer(weightedStressImage.select('Weighted_Stress'), stressVisParams, 'Crop Stress Levels');}
+  },
+  style: {margin: '10px 0'}
+});
+    
+var controlPanel = ui.Panel([
+  ui.Label('Layer Display:', {fontWeight: 'bold', margin: '0 8px 0 0'}),
+  layerSelect
+], ui.Panel.Layout.Flow('horizontal'));
+
+// Add all panels to map
+Map.add(controlPanel);
